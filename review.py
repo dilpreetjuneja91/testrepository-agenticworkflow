@@ -4,7 +4,8 @@ import requests
 from openai import OpenAI
 
 # CONFIG
-MAX_DIFF_CHARS = 12000
+MAX_DIFF_CHARS = 8000
+ALLOWED_EXTENSIONS = (".java", ".py", ".ts", ".js", ".go")
 
 # ENV VARIABLES
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -21,77 +22,122 @@ if not GITHUB_TOKEN:
 if not PR_NUMBER:
     raise Exception("PR_NUMBER is missing")
 
-# GET DIFF
-print("Fetching git diff...")
-
-try:
-    diff = subprocess.check_output(
-        ["git", "diff", "origin/main"]
-    ).decode("utf-8", errors="ignore")
-except Exception as e:
-    raise Exception(f"Failed to get git diff: {e}")
-
-if not diff.strip():
-    print("No diff found. Exiting.")
-    exit(0)
-
-# Trim diff
-diff = diff[:MAX_DIFF_CHARS]
-
-# AI REVIEW
-print("Sending diff to OpenAI...")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-prompt = f"""
-You are a strict senior software architect reviewing a pull request.
+# ---------------------------
+# GET DIFF PER FILE
+# ---------------------------
+print("Fetching changed files...")
 
-Review the following code diff and provide:
+files = subprocess.check_output(
+    ["git", "diff", "--name-only", "origin/main"]
+).decode().splitlines()
 
-- Bugs
-- Performance issues
-- Security concerns
-- Code quality improvements
+files = [f for f in files if f.endswith(ALLOWED_EXTENSIONS)]
 
-Be direct and concise.
+if not files:
+    print("No relevant files to review.")
+    exit(0)
+
+# ---------------------------
+# FUNCTION: REVIEW FILE
+# ---------------------------
+def review_file(file_path):
+    print(f"Reviewing {file_path}...")
+
+    try:
+        diff = subprocess.check_output(
+            ["git", "diff", "origin/main", "--", file_path]
+        ).decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"Failed to get diff for {file_path}: {e}")
+        return None
+
+    if not diff.strip():
+        return None
+
+    diff = diff[:MAX_DIFF_CHARS]
+
+    prompt = f"""
+You are a Principal Software Engineer conducting a rigorous code review.
+
+Focus ONLY on high-value issues.
+
+Review priorities:
+- Correctness (bugs, edge cases)
+- Performance & scalability
+- Reliability (timeouts, retries, failures)
+- Security risks
+- Architecture & design issues
+
+Rules:
+- No generic comments
+- No praise
+- Only actionable issues
+
+Format:
+Severity: Critical | High | Medium | Low
+Issue:
+Impact:
+Recommendation:
+
+Also include:
+- Missed Production Risks
+
+File: {file_path}
 
 Diff:
 {diff}
 """
 
-response = client.chat.completions.create(
-    model="gpt-4.1-mini",
-    messages=[
-        {"role": "system", "content": "You are a strict senior engineer."},
-        {"role": "user", "content": prompt}
-    ],
-    temperature=0.2
-)
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You review code like you are on-call for production incidents."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1
+        )
 
-review_text = response.choices[0].message.content
+        return response.choices[0].message.content
 
-if not review_text:
-    review_text = "AI returned no feedback."
+    except Exception as e:
+        print(f"OpenAI error for {file_path}: {e}")
+        return None
 
-# POST COMMENT TO PR
-print("Posting comment to PR...")
+# ---------------------------
+# POST COMMENT
+# ---------------------------
+def post_comment(body):
+    url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
 
-url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
 
-headers = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json"
-}
+    res = requests.post(url, headers=headers, json={"body": body})
 
-data = {
-    "body": f"AI PR Review\n\n{review_text}"
-}
+    if res.status_code != 201:
+        print("Failed to post comment", res.status_code, res.text)
 
-res = requests.post(url, headers=headers, json=data)
+# ---------------------------
+# MAIN LOOP
+# ---------------------------
+print("Starting AI review...")
 
-if res.status_code != 201:
-    print("Failed to post comment")
-    print(res.status_code, res.text)
-    exit(1)
+for file in files:
+    review = review_file(file)
 
-print("PR review comment posted successfully")
+    if not review or len(review.strip()) < 20:
+        continue
+
+    comment = f"## 🤖 AI Review — `{file}`\n\n{review}"
+
+    post_comment(comment)
+
+print("Review completed.")
