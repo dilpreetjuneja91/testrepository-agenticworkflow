@@ -59,32 +59,35 @@ def review_file(file_path):
     diff = diff[:MAX_DIFF_CHARS]
 
     prompt = f"""
-You are a Principal Software Engineer conducting a rigorous code review.
+You are a Principal Software Engineer.
 
-Focus ONLY on high-value issues.
+Analyze the diff and return STRICT JSON.
 
-Review priorities:
-- Correctness (bugs, edge cases)
-- Performance & scalability
-- Reliability (timeouts, retries, failures)
-- Security risks
-- Architecture & design issues
+Output format:
+{{
+  "issues": [
+    {{
+      "severity": "Critical|High|Medium|Low",
+      "issue": "...",
+      "impact": "...",
+      "recommendation": "..."
+    }}
+  ],
+  "fixes": [
+    {{
+      "file": "{file_path}",
+      "confidence": 0.0-1.0,
+      "patch": "UNIFIED_DIFF",
+      "explanation": "..."
+    }}
+  ]
+}}
 
 Rules:
-- No generic comments
-- No praise
-- Only actionable issues
-
-Format:
-Severity: Critical | High | Medium | Low
-Issue:
-Impact:
-Recommendation:
-
-Also include:
-- Missed Production Risks
-
-File: {file_path}
+- Only include fixes if HIGH confidence (>0.8)
+- Only fix small, safe issues (timeouts, null checks, logging)
+- Do NOT rewrite large code blocks
+- Patch must be valid unified diff
 
 Diff:
 {diff}
