@@ -68,10 +68,22 @@ Focus only on:
 - performance issues
 - security issues ONLY if clearly visible
 
+Confidence Guidelines (MANDATORY):
+
+- 0.9 – 1.0 → Clearly visible deterministic issue in diff
+- 0.75 – 0.89 → Strong signal but some assumption required
+- 0.6 – 0.74 → Possible issue but uncertain context
+- < 0.6 → DO NOT REPORT
+
+Rules:
+- DO NOT assign 1.0 unless the issue is explicitly visible in the diff
+- Most issues should be between 0.75 and 0.95
+- If unsure → lower confidence
+
 Format STRICTLY:
 
 Severity: Critical | High | Medium | Low
-Confidence: 0.0 - 1.0
+Confidence: (must follow rules above)
 Issue:
 Impact:
 Recommendation:
