@@ -1,7 +1,6 @@
 import os
 import subprocess
 import requests
-import json
 from openai import OpenAI
 
 # ---------------- CONFIG ----------------
@@ -13,14 +12,20 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 REPO = os.environ.get("GITHUB_REPOSITORY")
 PR_NUMBER = os.environ.get("PR_NUMBER")
 
-if not all([OPENAI_API_KEY, GITHUB_TOKEN, REPO, PR_NUMBER]):
-    raise Exception("Missing required environment variables")
+if not OPENAI_API_KEY:
+    raise Exception("OPENAI_API_KEY is missing")
+
+if not GITHUB_TOKEN:
+    raise Exception("GITHUB_TOKEN is missing")
+
+if not PR_NUMBER:
+    raise Exception("PR_NUMBER is missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------- UTILS ----------------
 def run(cmd):
-    return subprocess.run(cmd, check=True, capture_output=True).stdout.decode()
+    return subprocess.check_output(cmd).decode("utf-8", errors="ignore")
 
 # ---------------- FETCH FILES ----------------
 print("Fetching changed files...")
@@ -29,14 +34,18 @@ files = run(["git", "diff", "--name-only", "origin/main"]).splitlines()
 files = [f for f in files if f.endswith(ALLOWED_EXTENSIONS)]
 
 if not files:
-    print("No relevant files.")
+    print("No relevant files to review.")
     exit(0)
 
-# ---------------- AI ANALYSIS ----------------
-def analyze_file(file_path):
-    print(f"Analyzing {file_path}")
+# ---------------- REVIEW FUNCTION ----------------
+def review_file(file_path):
+    print(f"Reviewing {file_path}...")
 
-    diff = run(["git", "diff", "origin/main", "--", file_path])
+    try:
+        diff = run(["git", "diff", "origin/main", "--", file_path])
+    except Exception as e:
+        print(f"Failed to get diff for {file_path}: {e}")
+        return None
 
     if not diff.strip():
         return None
@@ -44,67 +53,59 @@ def analyze_file(file_path):
     diff = diff[:MAX_DIFF_CHARS]
 
     prompt = f"""
-You are a Principal Engineer reviewing production-critical code.
-
-Return STRICT JSON ONLY:
-
-{{
-  "issues": [
-    {{
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-      "type": "TIMEOUT_MISSING|RETRY_NO_BACKOFF|BLOCKING_CALL|NULL_RISK|RESOURCE_LEAK|SECURITY_RISK|OTHER",
-      "issue": "...",
-      "impact": "...",
-      "production_risk": "...",
-      "recommendation": "...",
-      "confidence": 0.0-1.0,
-      "blast_radius": "service-wide|request-path|edge-case",
-      "fixable": true/false
-    }}
-  ]
-}}
+Review ONLY the following code diff.
 
 Rules:
-- ONLY include issues that can impact production
-- IGNORE style, naming, formatting
-- If no real issues → return {{ "issues": [] }}
-- Prefer reliability, scalability, security
-- Be concise and specific
-- Confidence < 0.7 → DO NOT include
-- Max 3 issues per file
+- Only comment on code visible in the diff
+- Do not assume anything about the rest of the file
+- Do not summarize the file
+- Do not mention generic issues
+- If no real issue is visible, return: NO_ISSUES
 
-Common failure patterns:
-- Missing timeouts → thread exhaustion
-- Retry without backoff → cascading failures
-- Blocking calls in async flows
-- Resource leaks / unbounded memory
+Focus only on:
+- bugs
+- reliability issues (timeouts, retries)
+- performance issues
+- security issues ONLY if clearly visible
 
-File: {file_path}
+Format STRICTLY:
+
+Severity: Critical | High | Medium | Low
+Confidence: 0.0 - 1.0
+Issue:
+Impact:
+Recommendation:
 
 Diff:
 {diff}
 """
 
     try:
-        res = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are on-call and responsible for production stability."
+                    "content": "You review code like you are responsible for production incidents."
                 },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1
         )
 
-        return json.loads(res.choices[0].message.content)
+        output = response.choices[0].message.content.strip()
+
+        # Kill noise
+        if not output or "NO_ISSUES" in output:
+            return None
+
+        return output
 
     except Exception as e:
-        print(f"AI error: {e}")
+        print(f"OpenAI error for {file_path}: {e}")
         return None
 
-# ---------------- GITHUB COMMENT ----------------
+# ---------------- POST COMMENT ----------------
 def post_comment(body):
     url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
 
@@ -116,68 +117,19 @@ def post_comment(body):
     res = requests.post(url, headers=headers, json={"body": body})
 
     if res.status_code != 201:
-        print("Failed to post comment:", res.text)
-
-# ---------------- FORMAT OUTPUT ----------------
-def format_issues(file, issues):
-    if not issues:
-        return None
-
-    # sort by severity + confidence
-    severity_order = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4}
-
-    issues = sorted(
-        issues,
-        key=lambda x: (severity_order.get(x["severity"], 5), -x["confidence"])
-    )
-
-    output = f"## 🤖 AI Review — `{file}`\n\n"
-
-    for i in issues:
-        output += f"""
-### {i['severity']} — {i['type']}
-
-**Issue**  
-{i['issue']}
-
-**Impact**  
-{i['impact']}
-
-**Production Risk**  
-{i['production_risk']}
-
-**Recommendation**  
-{i['recommendation']}
-
-**Confidence**: {round(i['confidence'], 2)}  
-**Blast Radius**: {i['blast_radius']}  
-**Fixable**: {i['fixable']}
-
----
-"""
-
-    return output
+        print("Failed to post comment", res.status_code, res.text)
 
 # ---------------- MAIN ----------------
 print("Starting AI review...")
 
 for file in files:
-    result = analyze_file(file)
+    review = review_file(file)
 
-    if not result or not result.get("issues"):
+    if not review:
         continue
 
-    issues = result["issues"]
+    comment = f"## 🤖 AI Review — `{file}`\n\n{review}"
 
-    # final safety filter
-    issues = [i for i in issues if i.get("confidence", 0) >= 0.7]
-
-    if not issues:
-        continue
-
-    comment = format_issues(file, issues)
-
-    if comment:
-        post_comment(comment)
+    post_comment(comment)
 
 print("Review completed.")
